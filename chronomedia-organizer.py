@@ -3,241 +3,188 @@ import subprocess
 import json
 import shutil
 import csv
-from pathlib import Path
-from datetime import datetime
+import os
 import hashlib
 import logging
+import time
+from pathlib import Path
+from datetime import datetime
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-VIDEO_EXTS = {".mov",".mp4",".m4v",".avi",".mkv"}
-IMAGE_EXTS = {".heic",".jpg",".jpeg",".png",".gif",".tif",".tiff"}
+# Constants
+VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv"}
+IMAGE_EXTS = {".heic", ".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff"}
 
 def sha1(file):
-
     h = hashlib.sha1()
-
-    with open(file,"rb") as f:
-        while True:
-            chunk = f.read(8192)
-            if not chunk:
-                break
-            h.update(chunk)
-
-    return h.hexdigest()
-
+    try:
+        with open(file, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk: break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
 
 def sanitize(name):
-
-    bad = ['<','>',':','"','/','\\','|','?','*']
-
+    bad = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
     for c in bad:
-        name = name.replace(c,"_")
-
+        name = name.replace(c, "_")
     return name
 
-
-def parse_date(meta,path):
-
-    for tag in ["DateTimeOriginal","CreateDate","MediaCreateDate"]:
-
+def parse_date(meta, path):
+    for tag in ["DateTimeOriginal", "CreateDate", "MediaCreateDate"]:
         if tag in meta:
-
             try:
-                return datetime.strptime(meta[tag],"%Y:%m:%d %H:%M:%S")
-            except:
-                pass
-
+                return datetime.strptime(meta[tag][:19], "%Y:%m:%d %H:%M:%S")
+            except Exception: pass
     return datetime.fromtimestamp(path.stat().st_mtime)
 
+def process_metadata_chunk(file_paths):
+    if not file_paths: return []
+    cmd = ["exiftool", "-json", "-fast"] + [str(f) for f in file_paths]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    try:
+        return json.loads(result.stdout) if result.stdout.strip() else []
+    except Exception: return []
 
-def get_metadata(source):
+def get_metadata_parallel(file_list, workers=None):
+    if not file_list: return []
+    workers = workers or (os.cpu_count() or 4)
+    all_metadata = []
+    chunk_size = 50
+    chunks = [file_list[i:i + chunk_size] for i in range(0, len(file_list), chunk_size)]
+    
+    print(f"\n--- Extracting metadata using {workers} parallel workers ---")
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(process_metadata_chunk, chunk) for chunk in chunks]
+        with tqdm(total=len(file_list), desc="Reading Metadata", unit="file") as pbar:
+            for future in as_completed(futures):
+                batch_result = future.result()
+                all_metadata.extend(batch_result)
+                pbar.update(len(batch_result) if batch_result else chunk_size)
+    return all_metadata
 
-    print("\nReading metadata using ExifTool...\n")
-
-    cmd = ["exiftool","-json","-r",str(source)]
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore"
-    )
-
-    if not result.stdout.strip():
-        print("No files found.")
-        exit()
-
-    return json.loads(result.stdout)
-
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description="ChronoMedia Organizer — organize media files into chronological folders"
-    )
-
-    parser.add_argument("--source",required=True,help="Source media folder")
-    parser.add_argument("--dest",required=True,help="Destination organized folder")
-
-    parser.add_argument(
-        "--report",
-        action="store_true",
-        help="Generate CSV report"
-    )
-
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Simulate without copying files"
-    )
-
-    args = parser.parse_args()
-
-    source = Path(args.source)
-    dest = Path(args.dest)
-
-    dest.mkdir(parents=True,exist_ok=True)
-
-    run_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    log_file = dest / f"chronomedia_log_{run_time}.log"
-
-    logging.basicConfig(
-        filename=log_file,
-        level=logging.INFO,
-        format="%(asctime)s %(message)s"
-    )
-
-    all_files = [f for f in source.rglob("*") if f.is_file()]
-
-    print("\n--------------------------------------")
-    print("ChronoMedia Organizer")
-    print("--------------------------------------")
-    print("Source folder      :",source)
-    print("Destination folder :",dest)
-    print("Files detected     :",len(all_files))
-    print("--------------------------------------\n")
-
-    confirm = input("Proceed with organization? (y/n): ")
-
-    if confirm.lower() != "y":
-        print("Cancelled.")
-        return
-
-    metadata = get_metadata(source)
-
-    by_stem = {}
-
-    for item in metadata:
-
-        p = Path(item["SourceFile"])
-
-        by_stem.setdefault(p.stem,[]).append(p)
-
-    seen_hash = set()
-
-    stats = {
-        "copied":0,
-        "duplicates":0,
-        "skipped":0
-    }
-
-    report_rows = []
-
-    for item in tqdm(metadata,desc="Processing media"):
-
-        src = Path(item["SourceFile"])
-
+def process_single_file(item, by_stem, dest, dry_run):
+    src_path_str = item.get("SourceFile", "Unknown")
+    try:
+        src = Path(src_path_str)
         if not src.exists():
-            continue
+            return "skipped", src_path_str, "File not found", None
 
-        date = parse_date(item,src)
-
-        year = date.strftime("%Y")
-        month = date.strftime("%Y-%m")
-
-        folder = dest / year / month
-        folder.mkdir(parents=True,exist_ok=True)
-
-        timestamp = date.strftime("%Y-%m-%d_%H-%M-%S")
+        date = parse_date(item, src)
+        year, month = date.strftime("%Y"), date.strftime("%Y-%m")
+        target_folder = dest / year / month
+        target_folder.mkdir(parents=True, exist_ok=True)
 
         ext = src.suffix.lower()
-
-        group = by_stem.get(src.stem,[])
-
+        group = by_stem.get(src.stem, [])
         has_image = any(p.suffix.lower() in IMAGE_EXTS for p in group)
         has_video = any(p.suffix.lower() in VIDEO_EXTS for p in group)
 
-        if has_image and has_video:
-            typetag="live"
+        tag = "live" if (has_image and has_video) else \
+              "video" if ext in VIDEO_EXTS else \
+              ("screenshot" if "screenshot" in src.name.lower() else "photo") if ext in IMAGE_EXTS else "misc"
 
-        elif ext in VIDEO_EXTS:
-            typetag="video"
+        filename = sanitize(f"{date.strftime('%Y-%m-%d_%H-%M-%S')}_{tag}")
+        target = target_folder / f"{filename}{ext}"
 
-        elif ext in IMAGE_EXTS:
+        # Collision & Duplicate handling
+        counter = 1
+        while target.exists():
+            if src.stat().st_size == target.stat().st_size:
+                if sha1(src) == sha1(target):
+                    return "duplicate", src_path_str, f"Existing: {target}", None
+            target = target_folder / f"{filename}_{counter}{ext}"
+            counter += 1
+        
+        if not dry_run:
+            retries = 3
+            for i in range(retries):
+                try:
+                    shutil.copy2(src, target)
+                    break 
+                except PermissionError:
+                    if i < retries - 1:
+                        time.sleep(0.3)
+                        continue
+                    else: raise
 
-            if "screenshot" in src.name.lower():
-                typetag="screenshot"
-            else:
-                typetag="photo"
+        return "copied", src_path_str, "Success", str(target)
+    except Exception as e:
+        return "error", src_path_str, str(e), None
 
-        else:
-            typetag="unknown"
+def main():
+    parser = argparse.ArgumentParser(description="ChronoMedia Organizer Parallel")
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--dest", required=True)
+    parser.add_argument("--report", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--workers", type=int, default=None)
 
-        base = sanitize(f"{timestamp}_{typetag}")
+    args = parser.parse_args()
+    source, dest = Path(args.source), Path(args.dest)
+    dest.mkdir(parents=True, exist_ok=True)
 
-        target = folder / f"{base}{ext}"
+    run_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = dest / f"chronomedia_log_{run_time}.log"
+    
+    # Custom logger setup for immediate flushing
+    logger = logging.getLogger("ChronoMedia")
+    logger.setLevel(logging.INFO)
+    handler = logging.FileHandler(log_file, encoding='utf-8')
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(handler)
 
-        if target.exists():
+    all_files = [f for f in source.rglob("*") if f.is_file()]
+    if not all_files: return
 
-            stats["skipped"]+=1
+    print(f"\nFiles detected: {len(all_files)}")
+    if input("Proceed? (y/n): ").lower() != 'y': return
 
-            continue
+    metadata = get_metadata_parallel(all_files, workers=args.workers)
 
-        filehash = sha1(src)
+    by_stem = {}
+    for item in metadata:
+        p = Path(item["SourceFile"])
+        by_stem.setdefault(p.stem, []).append(p)
 
-        if filehash in seen_hash:
+    stats = {"copied": 0, "duplicate": 0, "skipped": 0, "error": 0}
+    report_rows = []
+    
+    print(f"\n--- Organizing and Copying (Parallel) ---")
+    
+    max_threads = args.workers or 12
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        future_to_file = {executor.submit(process_single_file, item, by_stem, dest, args.dry_run): item for item in metadata}
+        
+        with tqdm(total=len(metadata), desc="Copying Files") as pbar:
+            for future in as_completed(future_to_file):
+                status, src_name, msg, target_path = future.result()
+                stats[status] += 1
+                
+                # Format log entry
+                if status == "error":
+                    logger.error(f"FAILED: {src_name} | Reason: {msg}")
+                elif status == "duplicate":
+                    logger.warning(f"DUPLICATE: {src_name} | {msg}")
+                elif status == "copied":
+                    logger.info(f"SUCCESS: {src_name} -> {target_path}")
+                    report_rows.append([src_name, target_path])
+                
+                pbar.update(1)
 
-            stats["duplicates"]+=1
-
-            continue
-
-        seen_hash.add(filehash)
-
-        if not args.dry_run:
-
-            shutil.copy2(src,target)
-
-        logging.info(f"{src} -> {target}")
-
-        stats["copied"]+=1
-
-        report_rows.append([str(src),str(target)])
-
-    print("\nProcessing complete\n")
-
-    print("Files copied     :",stats["copied"])
-    print("Duplicates found :",stats["duplicates"])
-    print("Skipped existing :",stats["skipped"])
-
-    if args.report:
-
-        report_file = dest / f"chronomedia_report_{run_time}.csv"
-
-        with open(report_file,"w",newline="",encoding="utf-8") as f:
-
+    if args.report and report_rows:
+        report_path = dest / f"report_{run_time}.csv"
+        with open(report_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-
-            writer.writerow(["Original Path","New Path"])
-
+            writer.writerow(["Original", "New"])
             writer.writerows(report_rows)
 
-        print("Report saved :",report_file)
+    print(f"\nDone! Copied: {stats['copied']} | Duplicates: {stats['duplicate']} | Errors: {stats['error']}")
+    print(f"Full log: {log_file}")
 
-    print("Log file :",log_file)
-    print("\nDone\n")
-
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
